@@ -1,4 +1,5 @@
 import argparse
+import inspect
 import pathlib
 import onnx
 import onnxsim
@@ -90,6 +91,23 @@ class CascadedNetONNX(CascadedNet):
         return x_pred, x_gt - x_pred
 
 
+# The TorchScript exporter this script was written for; torch >= 2.9 defaults to the
+# dynamo exporter, whose graph of this model yields NaNs.
+LEGACY_EXPORTER = {'dynamo': False} if 'dynamo' in inspect.signature(torch.onnx.export).parameters else {}
+
+
+class MaskOnlyONNX(torch.nn.Module):
+    """Spectrum [B, 2 (re, im), n_fft/2+1, n_frames] to the bounded complex mask of
+    the same shape, for hosts that run the STFT and ISTFT themselves. n_frames must be
+    a multiple of 32; pad the audio as CascadedNetONNX.forward does."""
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, spec):
+        return self.model._forward(spec)
+
+
 def load_sep_model(model_path, device='cpu'):
     model_path = pathlib.Path(model_path)
     config_file = model_path.with_name('config.yaml')
@@ -114,24 +132,42 @@ if __name__ == '__main__':
     p = argparse.ArgumentParser()
     p.add_argument('input_path', type=str)
     p.add_argument('output_path', type=str)
+    p.add_argument('--mask-only', action='store_true',
+                   help='export spectrum -> mask only, without the STFT and ISTFT')
     args = p.parse_args()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = load_sep_model(args.input_path, device=device)
-    waveform = torch.randn(3, 44100, device=device)
     with torch.no_grad():
-        torch.onnx.export(
-            model,
-            waveform,
-            args.output_path,
-            input_names=['waveform'],
-            output_names=['harmonic', 'noise'],
-            dynamic_axes={
-                'waveform': {0: 'batch_size', 1: 'n_samples'},
-                'harmonic': {0: 'batch_size', 1: 'n_samples'},
-                'noise': {0: 'batch_size', 1: 'n_samples'},
-            },
-            opset_version=17
-        )
+        if args.mask_only:
+            torch.onnx.export(
+                MaskOnlyONNX(model),
+                torch.randn(1, 2, model.output_bin, 256, device=device),
+                args.output_path,
+                input_names=['spec'],
+                output_names=['mask'],
+                dynamic_axes={
+                    'spec': {0: 'batch_size', 3: 'n_frames'},
+                    'mask': {0: 'batch_size', 3: 'n_frames'},
+                },
+                opset_version=17,
+                **LEGACY_EXPORTER
+            )
+        else:
+            waveform = torch.randn(3, 44100, device=device)
+            torch.onnx.export(
+                model,
+                waveform,
+                args.output_path,
+                input_names=['waveform'],
+                output_names=['harmonic', 'noise'],
+                dynamic_axes={
+                    'waveform': {0: 'batch_size', 1: 'n_samples'},
+                    'harmonic': {0: 'batch_size', 1: 'n_samples'},
+                    'noise': {0: 'batch_size', 1: 'n_samples'},
+                },
+                opset_version=17,
+                **LEGACY_EXPORTER
+            )
         onnx_model, check = onnxsim.simplify(args.output_path, include_subgraph=True)
         assert check, 'Simplified ONNX model could not be validated'
         onnx.save(onnx_model, args.output_path)
